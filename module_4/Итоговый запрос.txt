@@ -1,0 +1,165 @@
+WITH
+     Main AS -- Таблица с рейсами, вылетевшими из Анапы зимой 2017 года
+         (
+          SELECT
+             *
+          FROM
+             dst_project.flights
+          WHERE
+             departure_airport = 'AAQ'
+             AND (date_trunc('month', scheduled_departure) IN ('2017-01-01','2017-02-01', '2017-12-01'))
+             AND status NOT IN ('Cancelled')
+         ),
+         
+     B AS -- Таблица, считающая количество купленных билетов на все рейсы и их стоимость в разбивке по классам обслуживания
+         (
+          SELECT
+             Main.flight_id,
+             f.fare_conditions,
+             count(f.ticket_no) as people_count,
+             sum(f.amount) as income
+          FROM
+             Main
+                 LEFT JOIN dst_project.ticket_flights AS f
+                     ON Main.flight_id = f.flight_id
+          GROUP BY
+             1, 2
+          ORDER BY
+             1
+         ),
+         
+     economy AS -- Таблица с количеством и суммарной стоимостью билетов эконом-класса для каждого рейса
+         (
+          SELECT
+             b.flight_id,
+             b.people_count AS economy_count,
+             b.income AS economy_income
+          FROM
+             b
+          WHERE
+             b.fare_conditions = 'Economy'
+         ),
+         
+     business AS -- Таблица с количеством и суммарной стоимостью билетов бизнесс-класса для каждого рейса
+         (
+          SELECT
+             b.flight_id,
+             b.people_count AS business_count,
+             b.income AS business_income
+          FROM
+             b
+          WHERE
+             b.fare_conditions = 'Business'
+         ),
+         
+     Main_count AS -- объединение таблиц с вылетами и количеством билетов разного класса
+         (
+          SELECT
+             -- Перераспределим столбцы начальной таблицы для лучшей читаемости информации
+             -- и удалим столбец status.
+             Main.flight_id,
+             Main.flight_no,
+             Main.aircraft_code,
+             Main.departure_airport,
+             Main.arrival_airport,
+             Main.scheduled_departure,
+             Main.actual_departure,
+             Main.scheduled_arrival,
+             Main.actual_arrival,
+             -- Добавляем столбцы с новой информацией
+             EXTRACT (EPOCH FROM
+             (Main.actual_arrival - Main.actual_departure)
+             ) / 60 / 60 as flight_time,
+             economy.economy_count,
+             economy.economy_income,
+             business.business_count,
+             business.business_income,
+             economy.economy_count + business.business_count as total_count,
+             economy.economy_income + business.business_income as total_income
+          FROM
+             Main
+                 LEFT JOIN economy
+                     ON Main.flight_id = economy.flight_id
+                 LEFT JOIN business
+                     ON Main.flight_id = business.flight_id
+         ),
+         
+     fuel as -- Таблица с расчётом расхода топлива для каждого рейса
+     /*
+         В данной таблице используются следующие данные, полученные из интернета:
+         
+         Стоимость авиационного топлива в Анапе в январе 2017 года - 41435 рублей за тонну
+         Стоимость авиационного топлива в Анапе в феврале 2017 года - 39553 рубля за тонну
+         
+         Расход авиационного топлива для самолёта Boeing 737-300 - 25.5 грамм на пассажиро-километр
+         Расход авиационного топлива для самолёта Sukhoi Superjet-100 - 23.5 грамм на пассажиро-километр
+         Эти данные нуждаются в уточнении у специалистов, так же как и грамотная методика расчёта.
+         В интернете ведутся яростные споры на эту тему. Эта методика выбрана из-за того, что учитывает
+         количество пассажиров на борту.
+         
+         Расстояние от аэропорта Анапы до аэропорта EGO(Белгород) - 638
+         Расстояние от аэропорта Анапы до аэропорта SVO(Москва) - 1221
+         Расстояние от аэропорта Анапы до аэропорта NOZ(Новокузнецк) - 3658
+         Расстояние посчитано в онлайн-калькуляторе на специализированном сайте.
+         Не осуществлялся расчёт по координатам из-за того, что здесь не принципиальна такая точность.
+         
+         Далее в фильтрах используется то, что Sukhoi Superjet-100 летает только в Белгород,
+         а Boeing 737-300 только в Москву и Новокузнецк
+     */
+         (
+          SELECT
+             M.flight_id,
+             coalesce(
+             max(41435) filter (where date_part('month', M.actual_departure) = 1),
+             max(39553) filter (where date_part('month', M.actual_departure) = 2)
+             ) as fuel_price,
+             coalesce(
+             max((M.total_count * 23.5 * 638) / 1000000) filter (where M.arrival_airport = 'EGO'),
+             max((M.total_count * 25.5 * 1221) / 1000000) filter (where M.arrival_airport = 'SVO'),
+             max((M.total_count * 25.5 * 3658) / 1000000) filter (where M.arrival_airport = 'NOZ')
+             ) AS fuel_consumption
+          FROM
+             Main_count AS M
+          GROUP BY
+             1
+         )
+
+
+/*
+  Итоговая таблица, содержащая исходные данные о рейсах из Анапы, 
+  количество проданных билетов разного класса, их стоимость, расход
+  топлива для каждого рейса, затраты на топливо и суммарный доход
+  каждого рейса: Стоимость билетов - стоимость топлива
+*/
+SELECT
+     Main_count.*,
+     fuel.fuel_consumption,
+     fuel.fuel_price * fuel.fuel_consumption AS fuel_cost,
+     total_income - (fuel.fuel_price * fuel.fuel_consumption) AS revenue
+FROM
+     Main_count
+         JOIN fuel
+             ON Main_count.flight_id = fuel.flight_id
+             
+/*
+  Столбцы итоговой таблицы:
+  flight_id - уникальный номер рейса
+  flight_no - неуникальный номер рейса
+  aircraft_code - код самолёта, совершившего рейс
+  departure_airport - код аэропорта вылета в Анапе
+  arrival_airport - код аэропорта прилёта
+  scheduled_departure - время вылета из Анапы по расписанию
+  actual_departure - реальное время вылета рейса из Анапы
+  scheduled_arrival - время прилёта в аэропорт назначения по расписанию
+  actual_arrival - реальное время прилёта в аэропорт назначения
+  flight_time - время полёта в часах
+  economy_count - количество проданных билетов эконом-класса на рейс
+  economy_income - суммарная стоимость проданных билетов эконом-класса на рейс в рублях
+  business_count - количество проданных билетов бизнес-класса на рейс
+  business_income - суммарная стоимость проданных билетов бизнес-класса на рейс в рублях
+  total_count - суммарное количество проданных билетов на рейс
+  total_income - суммарная стоимость проданных билетов на рейс в рублях
+  fuel_consumption - потраченное топливо на рейс в тоннах
+  fuel_cost - затраты на топливо в рублях
+  revenue - выручка от рейса в рублях
+*/
